@@ -1,5 +1,6 @@
 #pragma once
 
+#include <csignal>
 #include <memory>
 #include <string>
 #include <vector>
@@ -126,8 +127,7 @@ class MasterClient {
      * @param object_infos Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]]
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
 
     /**
@@ -391,6 +391,15 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MarkTaskToComplete(
         const TaskCompleteRequest& task_complete);
+
+    /**
+     * @brief Notify master that a disk replica was evicted locally
+     * @param key The evicted object key
+     * @param replica_type DISK or LOCAL_DISK
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> EvictDiskReplica(
+        const std::string& key, ReplicaType replica_type);
 
    private:
     /**
