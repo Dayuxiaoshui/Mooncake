@@ -203,6 +203,16 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #else
 
+#ifdef USE_UBSHMEM
+    Transport* ubshmem_transport =
+        multi_transports_->installTransport("ubshmem", local_topology_);
+    if (!ubshmem_transport) {
+        LOG(ERROR) << "Failed to install UBShmem transport";
+        return -1;
+    }
+    auto_discover_ = false;
+#endif
+
 #if defined(USE_CXL) && !defined(USE_ASCEND) && \
     !defined(USE_ASCEND_HETEROGENEOUS)
     if (!env.GetCxlDevPath().empty()) {
@@ -242,19 +252,9 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             return -1;
         }
 #elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
-
         bool force_mnnvl = env.GetForceMnnvl();
         bool intranode_nvlink = env.GetIntranodeNvlink();
-        if (force_mnnvl || local_topology_->getHcaList().empty()) {
-            Transport* t =
-                multi_transports_->installTransport("nvlink", nullptr);
-            if (!t) {
-                LOG(ERROR) << "Failed to install NVLink transport";
-                return -1;
-            }
-            LOG(INFO) << "Using cross-node NVLink transport "
-                      << "(MC_FORCE_MNNVL or no HCA detected)";
-        } else if (intranode_nvlink) {
+        if (intranode_nvlink) {
             Transport* t =
                 multi_transports_->installTransport("nvlink_intra", nullptr);
             if (!t) {
@@ -263,6 +263,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
+        } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
+            Transport* t =
+                multi_transports_->installTransport("nvlink", nullptr);
+            if (!t) {
+                LOG(ERROR) << "Failed to install NVLink transport";
+                return -1;
+            }
+            LOG(INFO) << "Using cross-node NVLink transport "
+                      << "(MC_FORCE_MNNVL or no HCA detected)";
         } else {
             Transport* t =
                 multi_transports_->installTransport("rdma", local_topology_);

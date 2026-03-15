@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
 #include <optional>
 #include <ranges>
 #include <thread>
@@ -16,6 +17,7 @@
 
 #include "environ.h"
 #include "transfer_engine.h"
+#include "topology.h"
 #include "transfer_task.h"
 #include "transport/transport.h"
 #include "config.h"
@@ -23,6 +25,7 @@
 #include "client_buffer.hpp"
 #include "utils.h"
 #include "rpc_types.h"
+#include "local_hot_cache.h"
 
 namespace mooncake {
 
@@ -97,6 +100,10 @@ Client::~Client() {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         mounted_segments_.clear();
     }
+
+    // Stop hot cache handler and hot cache
+    hot_cache_handler_.reset();
+    hot_cache_.reset();
 
     // Stop task thread pool before stopping ping thread
     task_running_ = false;
@@ -259,7 +266,8 @@ ErrorCode Client::InitTransferEngine(
             auto_discover = env_auto_discover.value();
         } else {
             // Enable auto-discover for RDMA if no devices are specified
-            if (protocol == "rdma" && !device_names.has_value()) {
+            if ((protocol == "rdma" || protocol == "efa") &&
+                !device_names.has_value()) {
                 LOG(INFO)
                     << "Set auto discovery ON by default for RDMA protocol, "
                        "since no "
@@ -286,7 +294,7 @@ ErrorCode Client::InitTransferEngine(
         }
     }
 
-    if (protocol == "ascend") {
+    if (protocol == "ascend" || protocol == "ubshmem") {
         const char* ascend_use_fabric_mem =
             std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
         if (ascend_use_fabric_mem) {
@@ -321,7 +329,7 @@ ErrorCode Client::InitTransferEngine(
 
         Transport* transport = nullptr;
 
-        if (protocol == "rdma") {
+        if (protocol == "rdma" || protocol == "efa") {
             if (!device_names.has_value() || device_names->empty()) {
                 LOG(ERROR) << "RDMA protocol requires device names when auto "
                               "discovery is disabled";
@@ -343,7 +351,7 @@ ErrorCode Client::InitTransferEngine(
                           << topology->getHcaList().size() << " HCAs";
             }
 
-            transport = transfer_engine_->installTransport("rdma", nullptr);
+            transport = transfer_engine_->installTransport(protocol, nullptr);
             if (!transport) {
                 LOG(ERROR) << "Failed to install RDMA transport with specified "
                               "devices";
@@ -367,22 +375,23 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend") {
+        } else if (protocol == "ascend" || protocol == "ubshmem") {
             if (device_names.has_value()) {
-                LOG(WARNING) << "Ascend protocol does not use device "
-                                "names, ignoring";
+                LOG(WARNING) << protocol
+                             << " protocol does not use device names, ignoring";
             }
             try {
                 transport =
-                    transfer_engine_->installTransport("ascend", nullptr);
+                    transfer_engine_->installTransport(protocol, nullptr);
             } catch (std::exception& e) {
-                LOG(ERROR) << "ascend_transport_install_failed error_message=\""
+                LOG(ERROR) << protocol
+                           << "_transport_install_failed error_message=\""
                            << e.what() << "\"";
                 return ErrorCode::INTERNAL_ERROR;
             }
 
             if (!transport) {
-                LOG(ERROR) << "Failed to install Ascend transport";
+                LOG(ERROR) << "Failed to install " << protocol << " transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "cxl") {
@@ -509,6 +518,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     client->InitTransferSubmitter();
+    // Initialize local hot cache
+    err = client->InitLocalHotCache();
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to initialize local hot cache";
+    }
 
     return client;
 }
@@ -652,8 +666,20 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         return tl::unexpected(err);
     }
 
+    // Check local hot cache and update replica descriptor if cache hit
+    bool cache_used = false;
+    if (hot_cache_ && replica.is_memory_replica()) {
+        cache_used = RedirectToHotCache(object_key, replica);
+    }
+
     auto t0_get = std::chrono::steady_clock::now();
     err = TransferRead(replica, slices);
+
+    // Release the cache block after transfer completes (memcpy is done)
+    if (hot_cache_ && cache_used) {
+        hot_cache_->ReleaseHotKey(object_key);
+    }
+
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_get)
                       .count();
@@ -665,11 +691,25 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
     }
+
+    // Frequency admission: only promote frequently accessed keys to hot cache.
+    // Skip when cache_used — data was already served from local cache, no need
+    // to re-promote or increment the CMS counter.
+    if (ShouldAdmitToHotCache(object_key, cache_used)) {
+        ProcessSlicesAsync(object_key, slices, replica);
+    }
+
     if (query_result.IsLeaseExpired()) {
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                      << object_key;
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
+    // Log cache hit statistics
+    if (hot_cache_ && replica.is_memory_replica()) {
+        VLOG(1) << "Get completed: key=" << object_key
+                << " cache_hit=" << (cache_used ? 1 : 0);
+    }
+
     return {};
 }
 
@@ -677,6 +717,7 @@ struct BatchGetOperation {
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> batched_slices;
     std::vector<size_t> key_indexes;
+    std::vector<bool> cache_used;  // Track which keys used cache
     std::vector<TransferFuture> futures;
 };
 
@@ -710,6 +751,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
             continue;
         }
+
+        // Check local hot cache and update replica descriptor if cache hit
+        bool cache_used = false;
+        if (hot_cache_ && replica.is_memory_replica()) {
+            cache_used = RedirectToHotCache(key, replica);
+        }
+
         auto& memory_descriptor = replica.get_memory_descriptor();
         if (memory_descriptor.buffer_descriptor.size_ == 0) {
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -721,13 +769,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         op.replicas.emplace_back(replica);
         op.batched_slices.emplace_back(slices_it->second);
         op.key_indexes.emplace_back(i);
+        op.cache_used.emplace_back(cache_used);
     }
     for (auto& seg_to_op : seg_to_op_map) {
         auto& op = seg_to_op.second;
         auto future = transfer_submitter_->submit_batch(
             op.replicas, op.batched_slices, TransferRequest::READ);
         if (!future) {
-            for (auto index : op.key_indexes) {
+            for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
+                auto index = op.key_indexes[idx];
+                if (hot_cache_ && idx < op.cache_used.size() &&
+                    op.cache_used[idx]) {
+                    hot_cache_->ReleaseHotKey(object_keys[index]);
+                }
                 results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
                 LOG(ERROR) << "Failed to submit transfer operation for key: "
                            << object_keys[index];
@@ -743,16 +797,42 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         }
         ErrorCode result = op.futures[0].get();
         if (result != ErrorCode::OK) {
-            for (auto index : op.key_indexes) {
+            for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
+                auto index = op.key_indexes[idx];
+                // Release cache block even on failure (memcpy may have started)
+                if (hot_cache_ && idx < op.cache_used.size() &&
+                    op.cache_used[idx]) {
+                    hot_cache_->ReleaseHotKey(object_keys[index]);
+                }
                 results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
                 LOG(ERROR) << "Failed to submit transfer operation for key: "
                            << object_keys[index];
             }
         } else {
-            for (auto index : op.key_indexes) {
+            for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
+                auto index = op.key_indexes[idx];
                 VLOG(1) << "Transfer completed successfully for key: "
                         << object_keys[index];
                 results[index] = {};
+
+                // Release the cache block after transfer completes (memcpy is
+                // done)
+                if (hot_cache_ && idx < op.cache_used.size() &&
+                    op.cache_used[idx]) {
+                    hot_cache_->ReleaseHotKey(object_keys[index]);
+                }
+
+                // Frequency admission: only promote frequently accessed keys.
+                // Skip when cache was used (data served from local cache).
+                if (idx < op.replicas.size() &&
+                    idx < op.batched_slices.size() &&
+                    ShouldAdmitToHotCache(
+                        object_keys[index],
+                        idx < op.cache_used.size() && op.cache_used[idx])) {
+                    ProcessSlicesAsync(object_keys[index],
+                                       op.batched_slices[idx],
+                                       op.replicas[idx]);
+                }
             }
         }
     }
@@ -791,11 +871,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     // Collect all transfer operations for parallel execution
-    std::vector<std::tuple<size_t, std::string, TransferFuture>>
+    // Tuple: (index, key, future, replica, cache_used)
+    std::vector<std::tuple<size_t, std::string, TransferFuture,
+                           Replica::Descriptor, bool>>
         pending_transfers;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
+
+    // Collect cache hit statistics for the entire batch
+    size_t total_cache_hits = 0;
 
     // Submit all transfers in parallel
     for (size_t i = 0; i < object_keys.size(); ++i) {
@@ -821,10 +906,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             continue;
         }
 
+        bool cache_used = false;
+        if (hot_cache_ && replica.is_memory_replica()) {
+            cache_used = RedirectToHotCache(key, replica);
+            if (cache_used) {
+                total_cache_hits++;
+            }
+        }
+
         // Submit transfer operation asynchronously
         auto future = transfer_submitter_->submit(replica, slices_it->second,
                                                   TransferRequest::READ);
         if (!future) {
+            // Release cache block if submit failed
+            if (hot_cache_ && cache_used) {
+                hot_cache_->ReleaseHotKey(key);
+            }
             LOG(ERROR) << "Failed to submit transfer operation for key: "
                        << key;
             results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
@@ -834,12 +931,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         VLOG(1) << "Submitted transfer for key " << key
                 << " using strategy: " << static_cast<int>(future->strategy());
 
-        pending_transfers.emplace_back(i, key, std::move(*future));
+        pending_transfers.emplace_back(i, key, std::move(*future), replica,
+                                       cache_used);
     }
 
     // Wait for all transfers to complete
-    for (auto& [index, key, future] : pending_transfers) {
+    for (auto& [index, key, future, stored_replica, cache_used] :
+         pending_transfers) {
         ErrorCode result = future.get();
+
+        // Release the cache block after transfer completes (memcpy is done)
+        if (hot_cache_ && cache_used) {
+            hot_cache_->ReleaseHotKey(key);
+        }
         if (result != ErrorCode::OK) {
             LOG(ERROR) << "Transfer failed for key: " << key
                        << " with error: " << static_cast<int>(result);
@@ -847,6 +951,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         } else {
             VLOG(1) << "Transfer completed successfully for key: " << key;
             results[index] = {};
+
+            // Frequency admission: only promote frequently accessed keys.
+            // Skip when cache was used (data served from local cache).
+            if (hot_cache_) {
+                auto slices_it = slices.find(key);
+                if (slices_it != slices.end() &&
+                    ShouldAdmitToHotCache(key, cache_used)) {
+                    ProcessSlicesAsync(key, slices_it->second, stored_replica);
+                }
+            }
         }
     }
 
@@ -869,8 +983,39 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         metrics_->transfer_metric.batch_get_latency_us.observe(us_batch_get);
     }
 
-    VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
+    // Log overall cache hit statistics for the entire batch
+    if (hot_cache_) {
+        VLOG(1) << "BatchGet completed: num_keys=" << object_keys.size()
+                << " total_cache_hits=" << total_cache_hits;
+    } else {
+        VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
+    }
     return results;
+}
+
+bool Client::RedirectToHotCache(const std::string& key,
+                                Replica::Descriptor& replica) {
+    if (!replica.is_memory_replica() || !hot_cache_) {
+        return false;
+    }
+
+    auto& mem_desc = replica.get_memory_descriptor();
+    HotMemBlock* blk = hot_cache_->GetHotKey(key);
+    if (blk == nullptr) {
+        return false;
+    }
+
+    if (mem_desc.buffer_descriptor.size_ != blk->size) {
+        LOG(ERROR) << "Cache hit but size mismatch for key: " << key;
+        return false;
+    }
+
+    mem_desc.buffer_descriptor.transport_endpoint_ =
+        (metadata_connstring_ == P2PHANDSHAKE) ? GetTransportEndpoint()
+                                               : local_hostname_;
+    mem_desc.buffer_descriptor.buffer_address_ =
+        reinterpret_cast<uintptr_t>(blk->addr);
+    return true;
 }
 
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
@@ -1503,8 +1648,27 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     return master_client_.RemoveAll(force);
 }
 
+tl::expected<void, ErrorCode> Client::EvictDiskReplica(
+    const std::string& key, ReplicaType replica_type) {
+    return master_client_.EvictDiskReplica(key, replica_type);
+}
+
+std::vector<int> Client::GetNicNumaNodes() const {
+    std::set<int> nodes;
+    if (!transfer_engine_) return {};
+    auto topo = transfer_engine_->getLocalTopology();
+    if (!topo) return {};
+    for (auto& [name, entry] : topo->getMatrix()) {
+        if (name.rfind("cpu:", 0) != 0 || entry.preferred_hca.empty()) continue;
+        int node = std::stoi(name.substr(4));
+        nodes.insert(node);
+    }
+    return {nodes.begin(), nodes.end()};
+}
+
 tl::expected<void, ErrorCode> Client::MountSegment(
-    const void* buffer, size_t size, const std::string& protocol) {
+    const void* buffer, size_t size, const std::string& protocol,
+    const std::string& location) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -1527,8 +1691,8 @@ tl::expected<void, ErrorCode> Client::MountSegment(
         }
     }
 
-    int rc = transfer_engine_->registerLocalMemory(
-        (void*)buffer, size, kWildcardLocation, true, true);
+    int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
+                                                   location, true, true);
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed base=" << buffer
                    << " size=" << size << ", error=" << rc;
@@ -1930,7 +2094,7 @@ void Client::PutToLocalFile(const std::string& key,
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
         // Store the object
-        auto store_result = backend->StoreObject(path, value);
+        auto store_result = backend->StoreObject(path, value, key);
         ReplicaType replica_type = ReplicaType::DISK;
 
         if (!store_result) {
@@ -1941,6 +2105,17 @@ void Client::PutToLocalFile(const std::string& key,
                 LOG(ERROR) << "Failed to revoke put operation for key: " << key;
             }
             return;
+        }
+
+        // Notify master about any evicted disk replicas
+        for (const auto& evicted_key : store_result.value()) {
+            auto evict_result =
+                master_client_.EvictDiskReplica(evicted_key, replica_type);
+            if (!evict_result) {
+                LOG(WARNING)
+                    << "Failed to notify master about evicted key: "
+                    << evicted_key << ", error: " << evict_result.error();
+            }
         }
 
         // If storage succeeded, end the put operation
@@ -2189,6 +2364,7 @@ void Client::PingThreadMain(bool is_ha_mode,
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;
+            last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
             if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
@@ -2206,6 +2382,7 @@ void Client::PingThreadMain(bool is_ha_mode,
         }
 
         ping_fail_count++;
+        last_ping_success_.store(false);
         if (ping_fail_count < max_ping_fail_count) {
             LOG(ERROR) << "Failed to ping master";
             std::this_thread::sleep_for(
@@ -2308,6 +2485,156 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
     }
 
     return replica_list[0];
+}
+
+size_t Client::GetLocalHotCacheSizeFromEnv() {
+    if (const char* ev_size = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE")) {
+        std::string ev_size_str(ev_size);
+        std::string error_msg = "Invalid MC_STORE_LOCAL_HOT_CACHE_SIZE='" +
+                                ev_size_str + "', disable local hot cache";
+        // Check for negative values
+        if (!ev_size_str.empty() && ev_size_str[0] == '-') {
+            LOG(WARNING) << error_msg;
+            return 0;
+        }
+        try {
+            unsigned long long v = std::stoull(ev_size_str, nullptr, 10);
+            if (v > 0) {
+                return static_cast<size_t>(v);
+            } else {
+                LOG(WARNING) << error_msg;
+                return 0;
+            }
+        } catch (const std::exception&) {
+            LOG(WARNING) << error_msg;
+            return 0;
+        }
+    }
+    return 0;
+}
+
+size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
+    if (const char* ev_block_size =
+            std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE")) {
+        std::string ev_block_size_str(ev_block_size);
+        std::string error_msg = "Invalid MC_STORE_LOCAL_HOT_BLOCK_SIZE='" +
+                                ev_block_size_str +
+                                "', using default block size";
+        // Check for negative values
+        if (!ev_block_size_str.empty() && ev_block_size_str[0] == '-') {
+            LOG(WARNING) << error_msg;
+            return default_value;
+        }
+        try {
+            unsigned long long v = std::stoull(ev_block_size_str, nullptr, 10);
+            if (v > 0) {
+                return static_cast<size_t>(v);
+            } else {
+                LOG(WARNING) << error_msg;
+                return default_value;
+            }
+        } catch (const std::exception&) {
+            LOG(WARNING) << error_msg;
+            return default_value;
+        }
+    }
+    return default_value;
+}
+
+ErrorCode Client::InitLocalHotCache() {
+    // Defaults: hot cache is disabled unless MC_STORE_LOCAL_HOT_CACHE_SIZE is
+    // set to a positive value; when enabled, default block size is 16MB and
+    // thread_num is 2.
+    size_t block_size = 16 * 1024 * 1024;  // 16MB default block size
+    size_t thread_num = 2;
+
+    // Read MC_STORE_LOCAL_HOT_CACHE_SIZE from environment
+    size_t total_cache = GetLocalHotCacheSizeFromEnv();
+    if (total_cache == 0) {
+        // Environment variable not set or invalid, disable cache
+        hot_cache_.reset();
+        hot_cache_handler_.reset();
+        admission_sketch_.reset();
+        return ErrorCode::OK;
+    }
+
+    // Read MC_STORE_LOCAL_HOT_BLOCK_SIZE from environment
+    block_size = GetLocalHotBlockSizeFromEnv(block_size);
+
+    // MC_STORE_LOCAL_HOT_CACHE_USE_SHM: "1" enables memfd-backed shm (default
+    // off). When enabled, hot cache is shareable with dummy clients via IPC.
+    bool use_shm = false;
+    if (const char* ev = std::getenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM")) {
+        use_shm = (std::string(ev) == "1");
+    }
+
+    // Enable hot cache
+    {
+        hot_cache_ =
+            std::make_shared<LocalHotCache>(total_cache, block_size, use_shm);
+        // Check if cache initialization was successful
+        if (hot_cache_->GetCacheSize() == 0) {
+            LOG(ERROR)
+                << "Local hot cache creation failed: no blocks allocated. "
+                << "total_cache=" << total_cache;
+            hot_cache_.reset();
+            hot_cache_handler_.reset();
+            admission_sketch_.reset();
+            return ErrorCode::INVALID_PARAMS;
+        }
+        LOG(INFO) << "Local hot cache enabled with cache size=" << total_cache
+                  << ", block size=" << block_size
+                  << ", block amount=" << hot_cache_->GetCacheSize()
+                  << ", shm=" << (use_shm ? "on" : "off");
+        // Create async handler with 2 worker threads
+        hot_cache_handler_ =
+            std::make_unique<LocalHotCacheHandler>(hot_cache_, thread_num);
+        admission_sketch_ = std::make_unique<CountMinSketch>();
+
+        // MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD: minimum CMS count before a
+        // key is admitted to hot cache (default 2).
+        if (const char* ev =
+                std::getenv("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD")) {
+            std::string ev_str(ev);
+            std::string error_msg =
+                "Invalid MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD='" + ev_str +
+                "', using default";
+            try {
+                unsigned long long v = std::stoull(ev_str, nullptr, 10);
+                if (v > 0 && v <= 255) {
+                    admission_threshold_ = static_cast<uint8_t>(v);
+                } else {
+                    LOG(WARNING) << error_msg;
+                }
+            } catch (const std::exception&) {
+                LOG(WARNING) << error_msg;
+            }
+        }
+    }
+    return ErrorCode::OK;
+}
+
+void Client::ProcessSlicesAsync(const std::string& key,
+                                const std::vector<Slice>& slices,
+                                const Replica::Descriptor& replica) {
+    if (!(hot_cache_ && replica.is_memory_replica())) {
+        return;
+    }
+
+    // Skip local data unless hot cache is in shm mode (shared with dummy
+    // clients who need local data cached for zero-copy access).
+    if (!hot_cache_->IsShm() && IsReplicaOnLocalMemory(replica)) {
+        return;
+    }
+
+    // Identify TE transfer slices (non-local) and submit async put tasks
+    for (size_t i = 0; i < slices.size(); ++i) {
+        if (!hot_cache_handler_->SubmitPutTask(key, slices[i])) {
+            LOG(ERROR) << "Failed to submit hot cache put task for key=" << key
+                       << " slice_idx=" << i;
+            return;
+        }
+    }
 }
 
 bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
