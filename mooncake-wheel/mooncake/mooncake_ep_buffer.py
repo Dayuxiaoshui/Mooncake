@@ -189,7 +189,10 @@ class Buffer:
             ]
             dist.all_gather(handles, local_handle_tensor, self.group)
             remote_handles = [h.tolist() for h in handles]
-            self.runtime.sync_nvlink_ipc_handles(remote_handles)
+            from mooncake.ep import get_active_ranks
+            active_ranks_mask = get_active_ranks(self.backend).tolist()
+            self.runtime.sync_nvlink_ipc_handles(remote_handles,
+                                                 active_ranks_mask)
         except Exception as e:
             import warnings
 
