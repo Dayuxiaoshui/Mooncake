@@ -21,7 +21,7 @@ tl::expected<void, ErrorCode> ConnectorImporter::ImportObject(
     std::string key = store_key.empty() ? external_key : store_key;
     std::span<const char> data(reinterpret_cast<const char*>(buffer.data()),
                                buffer.size());
-    int result = client_->put(key, data, config);
+    int result = client_->Put(key, data, config);
     if (result != 0) {
         return tl::make_unexpected(ErrorCode::WRITE_FAIL);
     }

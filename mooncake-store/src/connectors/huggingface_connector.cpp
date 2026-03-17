@@ -67,7 +67,7 @@ tl::expected<void, std::string> HuggingFaceConnector::HttpGet(
     if (res != CURLE_OK) {
         return tl::make_unexpected(std::string(curl_easy_strerror(res)));
     }
-    return ;
+    return {};
 }
 
 tl::expected<void, std::string> HuggingFaceConnector::ListObjects(
