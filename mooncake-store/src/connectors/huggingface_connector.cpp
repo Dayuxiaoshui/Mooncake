@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <glog/logging.h>
+#include <stdexcept>
 
 namespace mooncake {
 

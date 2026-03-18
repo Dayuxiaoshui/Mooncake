@@ -1,5 +1,7 @@
 #include "connectors/data_connector.h"
 
+#include <stdexcept>
+
 #ifdef HAVE_AWS_SDK
 #include "connectors/oss_connector.h"
 #endif

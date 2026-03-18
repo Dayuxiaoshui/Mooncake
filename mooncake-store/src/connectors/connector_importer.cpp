@@ -1,5 +1,8 @@
 #include "connectors/connector_importer.h"
 
+#include <cstring>
+
+#include "client_buffer.hpp"
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -11,6 +14,10 @@ ConnectorImporter::ConnectorImporter(std::shared_ptr<Client> client,
 tl::expected<void, ErrorCode> ConnectorImporter::ImportObject(
     const std::string& external_key, const std::string& store_key,
     const ReplicateConfig& config) {
+    if (!client_ || !connector_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     std::vector<uint8_t> buffer;
     auto download_result = connector_->DownloadObject(external_key, buffer);
     if (!download_result) {
@@ -18,13 +25,41 @@ tl::expected<void, ErrorCode> ConnectorImporter::ImportObject(
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
-    std::string key = store_key.empty() ? external_key : store_key;
-    std::span<const char> data(reinterpret_cast<const char*>(buffer.data()),
-                               buffer.size());
-    int result = client_->Put(key, data, config);
-    if (result != 0) {
-        return tl::make_unexpected(ErrorCode::WRITE_FAIL);
+    if (buffer.empty()) {
+        LOG(ERROR) << "Downloaded object is empty: " << external_key;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+
+    std::string key = store_key.empty() ? external_key : store_key;
+    auto allocator = ClientBufferAllocator::create(buffer.size());
+    if (!allocator) {
+        LOG(ERROR) << "Failed to allocate local buffer for connector import";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto register_result = client_->RegisterLocalMemory(
+        allocator->getBase(), allocator->size(), "cpu:0", false, false);
+    if (!register_result) {
+        LOG(ERROR) << "Failed to register local memory: "
+                   << register_result.error();
+        return tl::make_unexpected(register_result.error());
+    }
+
+    std::memcpy(allocator->getBase(), buffer.data(), buffer.size());
+    auto slices = split_into_slices(allocator->getBase(), buffer.size());
+
+    auto put_result = client_->Put(key, slices, config);
+    auto unregister_result =
+        client_->unregisterLocalMemory(allocator->getBase(), false);
+    if (!unregister_result) {
+        LOG(WARNING) << "Failed to unregister local memory after import: "
+                     << unregister_result.error();
+    }
+
+    if (!put_result) {
+        return tl::make_unexpected(put_result.error());
+    }
+
     return {};
 }
 
