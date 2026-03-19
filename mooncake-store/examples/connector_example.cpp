@@ -20,9 +20,13 @@ int main() {
 #ifdef HAVE_AWS_SDK
     auto oss_connector = DataConnector::Create(ConnectorType::OSS);
 
-    // Create client and importer
-    auto client = std::make_shared<Client>();
-    ConnectorImporter importer(client, std::move(oss_connector));
+    // Create client and importer using factory
+    auto client_opt = Client::Create();
+    if (!client_opt) {
+        // Failed to create client; abort example
+        return 1;
+    }
+    ConnectorImporter importer(client_opt.value(), std::move(oss_connector));
 
     // Import single object
     ReplicateConfig config;

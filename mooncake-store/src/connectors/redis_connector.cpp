@@ -14,7 +14,7 @@ RedisConnector::RedisConnector() : context_(nullptr), port_(6379) {
     const char* db = std::getenv("MOONCAKE_REDIS_DB");
 
     host_ = host ? host : "127.0.0.1";
-    port_ = port ? std::atoi(port) : 6379;
+    port_ = port ? std::stoi(port) : 6379;
 
     context_ = redisConnect(host_.c_str(), port_);
     if (!context_ || context_->err) {
@@ -90,6 +90,11 @@ tl::expected<void, std::string> RedisConnector::DownloadObject(
     if (reply->type == REDIS_REPLY_NIL) {
         freeReplyObject(reply);
         return tl::make_unexpected("Key not found: " + key);
+    }
+    if (reply->type == REDIS_REPLY_ERROR) {
+        std::string error = reply->str ? reply->str : "unknown Redis error";
+        freeReplyObject(reply);
+        return tl::make_unexpected("Redis GET error for key '" + key + "': " + error);
     }
     if (reply->type != REDIS_REPLY_STRING) {
         freeReplyObject(reply);

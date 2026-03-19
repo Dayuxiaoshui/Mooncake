@@ -58,7 +58,7 @@ auto connector = mooncake::DataConnector::Create(
     mooncake::ConnectorType::OSS);
 
 // Create importer
-auto client = std::make_shared<mooncake::Client>();
+auto client = mooncake::Client::Create(/* options... */);
 mooncake::ConnectorImporter importer(client, std::move(connector));
 
 // Import single object
@@ -72,26 +72,10 @@ auto count = importer.ImportByPrefix("models/", config);
 
 ## Python Usage
 
-```python
-import mooncake_store as mc
+Python bindings for data connectors (e.g., creating connectors and using
+`ConnectorImporter` from Python) are not yet available in this release.
 
-# Create client
-client = mc.Client.create(...)
-
-# Create connector
-connector = mc.create_connector(mc.ConnectorType.OSS)
-
-# Create importer
-importer = mc.ConnectorImporter(client, connector)
-
-# Import single object
-config = mc.ReplicateConfig(replica_num=2)
-importer.import_object("models/bert.bin", "bert_model", config)
-
-# Import by prefix
-count = importer.import_by_prefix("models/", config)
-print(f"Imported {count} objects")
-```
+You can currently use connectors via the C++ API described above.
 
 ## Build Configuration
 
@@ -117,7 +101,7 @@ cmake .. # HuggingFace connector always available
 ## Implementation Details
 
 - Connectors handle external operations (list, download)
-- Integration via existing `Client::put()` API
+- Integration via existing `Client::Put()` API
 - Configuration via environment variables
 - Optional dependencies with conditional compilation
 - Total implementation: ~660 LOC
