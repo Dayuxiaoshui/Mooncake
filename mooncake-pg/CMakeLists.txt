@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(mooncake-ep)
+project(mooncake-pg)
 
 # Find PyTorch's CMake prefix path
 execute_process(
